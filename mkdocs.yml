@@ -104,6 +104,7 @@ nav:
       - "LocalEnvironment": "reference/environments/local.md"
       - "DockerEnvironment": "reference/environments/docker.md"
       - "SingularityEnvironment": "reference/environments/singularity.md"
+      - "EnrootEnvironment": "reference/environments/enroot.md"
       - "SwerexDockerEnvironment": "reference/environments/swerex_docker.md"
       - "BubblewrapEnvironment": "reference/environments/bubblewrap.md"
       - "ContreeEnvironment": "reference/environments/contree.md"
