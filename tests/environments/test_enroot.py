@@ -34,7 +34,12 @@ def run_mock():
 
 
 def _borrowed(**kwargs) -> EnrootEnvironment:
-    """An environment that borrows an existing container (skips `enroot create`)."""
+    """An environment that borrows an existing container (skips `enroot create`).
+
+    `explicit_shell` is pinned so these tests never depend on a rootfs existing
+    on disk; the detection itself is covered separately below.
+    """
+    kwargs.setdefault("explicit_shell", False)
     return EnrootEnvironment(image="/img.sqsh", container_name="ctr", **kwargs)
 
 
@@ -72,7 +77,7 @@ def test_config_defaults():
 
 
 def test_creates_container_when_no_name_given(run_mock):
-    env = EnrootEnvironment(image="/img.sqsh")
+    env = EnrootEnvironment(image="/img.sqsh", explicit_shell=False)
 
     argv = run_mock.call_args_list[0].args[0]
     assert argv[:3] == ["enroot", "create", "--name"]
@@ -97,7 +102,7 @@ def test_borrowed_container_is_not_removed_on_cleanup(run_mock):
 
 
 def test_owned_container_is_removed_on_cleanup(run_mock):
-    env = EnrootEnvironment(image="/img.sqsh")
+    env = EnrootEnvironment(image="/img.sqsh", explicit_shell=False)
     run_mock.reset_mock()
 
     env.cleanup()
@@ -128,7 +133,7 @@ def _failing_create(n_failures: int):
 def test_create_is_retried_then_succeeds():
     with patch("minisweagent.environments.enroot.subprocess.run") as m:
         m.side_effect = _failing_create(1)
-        env = EnrootEnvironment(image="/img.sqsh")
+        env = EnrootEnvironment(image="/img.sqsh", explicit_shell=False)
 
     assert [c.args[0][1] for c in m.call_args_list] == ["create", "remove", "create"]
     assert env.container_name
@@ -138,7 +143,7 @@ def test_create_raises_after_exhausting_retries():
     with patch("minisweagent.environments.enroot.subprocess.run") as m:
         m.side_effect = _failing_create(99)
         with pytest.raises(subprocess.CalledProcessError):
-            EnrootEnvironment(image="/img.sqsh", create_retries=3)
+            EnrootEnvironment(image="/img.sqsh", create_retries=3, explicit_shell=False)
 
     assert [c.args[0][1] for c in m.call_args_list].count("create") == 3
 
@@ -313,25 +318,85 @@ def test_get_template_vars_merges_extra_kwargs(run_mock):
     assert vars_["extra"] == "x"
 
 
-# ------------------------------------------------------------------------- known bug
+# ------------------------------------------------------------- shell dispatch
+
+# enroot renders the image's ENTRYPOINT/CMD into the rootfs's /etc/rc. Whether a
+# shell is already interposed there decides how we must invoke `enroot start`;
+# guessing wrong fails every command (127 one way, 126 the other).
+RC_NO_ENTRYPOINT = """mkdir -p "/app" 2> /dev/null
+cd "/app" && unset OLDPWD || exit 1
+
+if [ $# -gt 0 ]; then
+    exec  "$@"
+else
+    exec  'bash'
+fi
+"""
+
+RC_BASH_ENTRYPOINT = """mkdir -p "/app" 2> /dev/null
+cd "/app" && unset OLDPWD || exit 1
+
+if [ $# -gt 0 ]; then
+    exec '/bin/bash' "$@"
+else
+    exec '/bin/bash'
+fi
+"""
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Known bug: no explicit shell is passed to `enroot start`, so images whose "
-        "default command is not bash treat the whole command string as a path to an "
-        "executable (`/app/{ while IFS= read ...: No such file or directory`). "
-        "Reproduced on SWE-Bench-Pro's ansible image in every batch run so far."
-    ),
-    strict=True,
-)
-def test_explicit_shell_is_passed_to_start(run_mock):
-    env = _borrowed()
+@pytest.fixture
+def rootfs(tmp_path, monkeypatch):
+    """A fake ENROOT_DATA_PATH; returns a writer for a container's /etc/rc."""
+    monkeypatch.setenv("ENROOT_DATA_PATH", str(tmp_path))
 
+    def write_rc(container: str, contents: str | None):
+        etc = tmp_path / container / "etc"
+        etc.mkdir(parents=True, exist_ok=True)
+        if contents is not None:
+            (etc / "rc").write_text(contents)
+
+    return write_rc
+
+
+def test_no_entrypoint_image_gets_an_explicit_shell(run_mock, rootfs):
+    """`exec "$@"` execs our argv directly, so we must supply the shell."""
+    rootfs("ctr", RC_NO_ENTRYPOINT)
+    env = EnrootEnvironment(image="/img.sqsh", container_name="ctr")
+
+    assert env._explicit_shell is True
     env.execute({"command": "true"})
+    assert _start_argv(run_mock)[-3:-1] == ["bash", "-c"]
 
+
+def test_bash_entrypoint_image_gets_no_extra_shell(run_mock, rootfs):
+    """`exec '/bin/bash' "$@"` already interposes bash; another would be exit 126."""
+    rootfs("ctr", RC_BASH_ENTRYPOINT)
+    env = EnrootEnvironment(image="/img.sqsh", container_name="ctr")
+
+    assert env._explicit_shell is False
+    env.execute({"command": "true"})
     argv = _start_argv(run_mock)
-    assert argv[-4:-2] == ["ctr", "bash"], argv
+    assert argv[-3] == "ctr"
+    assert argv[-2] == "-c"
+
+
+def test_explicit_shell_overrides_detection(run_mock, rootfs):
+    rootfs("ctr", RC_BASH_ENTRYPOINT)
+
+    assert EnrootEnvironment(image="/i", container_name="ctr", explicit_shell=True)._explicit_shell is True
+    rootfs("ctr2", RC_NO_ENTRYPOINT)
+    assert EnrootEnvironment(image="/i", container_name="ctr2", explicit_shell=False)._explicit_shell is False
+
+
+def test_missing_rc_falls_back_to_explicit_shell(run_mock, rootfs):
+    """A rootfs we cannot read must not silently produce 127 on every command."""
+    rootfs("ctr", None)
+    assert EnrootEnvironment(image="/i", container_name="ctr")._explicit_shell is True
+
+
+def test_unrecognised_rc_falls_back_to_explicit_shell(run_mock, rootfs):
+    rootfs("ctr", "# nothing that looks like a dispatch line\n")
+    assert EnrootEnvironment(image="/i", container_name="ctr")._explicit_shell is True
 
 
 # ------------------------------------------------------------------- real enroot runs

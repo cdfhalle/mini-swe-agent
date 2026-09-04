@@ -1,8 +1,10 @@
 import logging
 import os
+import re
 import shlex
 import subprocess
 import uuid
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -15,6 +17,11 @@ from minisweagent.utils.serialize import recursive_merge
 # KEY=VALUE -- values may contain spaces and quotes (PYTEST_ADDOPTS, NodeBB's
 # SETUP JSON, ...) -- so each line is exported whole rather than `source`-ing the
 # file (which would word-split them). Missing file / odd lines are ignored.
+# enroot renders the image's ENTRYPOINT/CMD into the rootfs's /etc/rc, which ends
+# in `exec [<entrypoint>...] "$@"`. Capturing the prefix tells us whether a shell
+# is already interposed. See EnrootEnvironmentConfig.explicit_shell.
+_EXEC_DISPATCH_RE = re.compile(r'^\s*exec\s+(.*?)"\$@"', re.MULTILINE)
+
 _APPLY_IMAGE_ENV = (
     '{ while IFS= read -r __e; do case "$__e" in ""|"#"*) : ;; *=*) export "$__e" ;; esac; '
     'done < /etc/environment; } 2>/dev/null; '
@@ -43,13 +50,32 @@ class EnrootEnvironmentConfig(BaseModel):
     """Retries for `enroot create` (unpacking large images can occasionally flake)."""
     start_args: list[str] = ["--rw"]
     """Args to `enroot start`. `--rw` is REQUIRED so that file edits persist
-    between commands (the analog of Singularity's `--writable`)."""
+    between commands (the analog of Singularity's `--writable`).
+
+    NOTE: `--rw` persists writes to the ROOTFS. Anything mounted over the rootfs
+    does not persist -- in particular `/tmp` is commonly a fresh tmpfs per
+    `enroot start`, so a file written there in one command is gone by the next.
+    Work inside the repo (e.g. /app) rather than /tmp."""
     shell: str = "bash"
-    """Shell used to run the agent's command string. NOTE for SWE-Bench Pro:
-    those images run bash by default (see Pro issue #6). enroot replaces the
-    default command with whatever you pass to `start`, so an explicit
-    `bash -c <cmd>` here normally sidesteps the Docker-style double-bash problem
-    -- but verify against issue #6 for your specific images before a full run."""
+    """Shell used to run the agent's command string, when one is needed at all.
+    See `explicit_shell`."""
+    explicit_shell: bool | None = None
+    """Whether to pass `<shell> -c <cmd>` to `enroot start`, or just `-c <cmd>`.
+
+    Whether a shell is needed is a property of the IMAGE, not of enroot. enroot
+    renders the image's ENTRYPOINT/CMD into the rootfs's /etc/rc, which ends in
+    either
+
+        exec "$@"                # no ENTRYPOINT: our args are exec'd directly,
+                                 # so we MUST supply the shell ourselves
+        exec '/bin/bash' "$@"    # ENTRYPOINT bash: a shell is ALREADY interposed,
+                                 # so supplying another gives `/bin/bash bash -c
+                                 # <cmd>`, i.e. bash tries to run a *file* named
+                                 # "bash" -> exit 126
+
+    Getting this wrong is silent and total: 127 on every command in the first
+    case, 126 in the second. `None` (the default) reads /etc/rc and decides per
+    container; True/False force it."""
     apply_image_env: bool = True
     """Apply the image's configured environment (PATH, GOPATH, etc.) before each
     command, the way Docker does automatically. enroot writes the docker image's
@@ -78,6 +104,41 @@ class EnrootEnvironment:
         )
         if self._owns_container:
             self._create_container()
+        self._explicit_shell = self._detect_explicit_shell()
+
+    def _rootfs(self) -> Path:
+        """Host-side path of the unpacked container rootfs."""
+        data_path = os.environ.get("ENROOT_DATA_PATH") or os.path.join(
+            os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "enroot"
+        )
+        return Path(data_path) / self.container_name
+
+    def _detect_explicit_shell(self) -> bool:
+        """Decide whether to pass an explicit shell -- see `explicit_shell`."""
+        if self.config.explicit_shell is not None:
+            return self.config.explicit_shell
+        rc_path = self._rootfs() / "etc" / "rc"
+        try:
+            rc = rc_path.read_text(errors="replace")
+        except OSError as e:
+            self.logger.warning(
+                f"Could not read {rc_path} ({e}); assuming the image has no ENTRYPOINT and "
+                f"passing an explicit '{self.config.shell} -c'. Set explicit_shell to override."
+            )
+            return True
+        # The generated /etc/rc dispatches with `exec [<entrypoint>...] "$@"`.
+        # An empty prefix means nothing is interposed and we must supply a shell.
+        match = _EXEC_DISPATCH_RE.search(rc)
+        if match is None:
+            self.logger.warning(
+                f"No `exec ... \"$@\"` line in {rc_path}; assuming an explicit shell is needed."
+            )
+            return True
+        needs_shell = not match.group(1).strip()
+        self.logger.debug(
+            f"{rc_path}: entrypoint prefix {match.group(1).strip()!r} -> explicit_shell={needs_shell}"
+        )
+        return needs_shell
 
     def _create_container(self) -> None:
         # Unpacks the squashfs into a writable rootfs under $ENROOT_DATA_PATH.
@@ -147,9 +208,10 @@ class EnrootEnvironment:
                 cmd += ["--env", f"{key}={value}"]
         for key, value in self.config.env.items():
             cmd += ["--env", f"{key}={value}"]
-        # default: cmd += [self.container_name, self.config.shell, "-c", command]
-        # swe-bench-pro images run bash by default so we should not specify it here (issue #6).
-        cmd += [self.container_name, "-c", command]
+        cmd.append(self.container_name)
+        if self._explicit_shell:
+            cmd.append(self.config.shell)
+        cmd += ["-c", command]
         try:
             result = subprocess.run(
                 cmd,
